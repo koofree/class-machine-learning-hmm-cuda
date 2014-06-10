@@ -1,0 +1,644 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+#include <cuda.h>
+#include <cutil.h>
+#include "/usr/local/cuda-5.5/include/cublas.h"
+
+#include "hmm.h"
+extern "C" {
+#include "hmm_bwa_cuda.h"
+}
+
+#define EXIT_ERROR 1.0f
+
+enum {
+	MAX_THREADS_PER_BLOCK = 256,
+	BLOCK_DIM = 16
+};
+
+/********************/
+cublasStatus cublas_status;
+int nstates;
+int nsymbols;
+int *obs;
+int length;
+float *scale;
+float *a_d;
+float *b_d;
+float *pi_d;
+float *alpha_d;
+float *beta_d;
+float *gamma_sum_d;
+float *xi_sum_d;
+float *c_d;
+float *ones_n_d;
+float *ones_s_d;
+
+/********************/
+
+
+__global__ void init_ones_dev(	float *ones_s_d,
+				int nsymbols)
+{
+	unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (idx < nsymbols) {
+		ones_s_d[idx] = 1.0f;
+	}
+}
+
+__global__ void init_alpha_dev(	float *b_d,
+				float *pi_d,
+				int nstates,
+				float *alpha_d,
+				float *ones_n_d,
+				int obs_t)
+{
+	unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (idx < nstates) {
+		alpha_d[idx] = pi_d[idx] * b_d[(obs_t * nstates) + idx];
+		ones_n_d[idx] = 1.0f;
+	}
+}
+
+__global__ void calc_alpha_dev(	int nstates,
+				float *alpha_d,
+				float *b_d,
+				int obs_t)
+{
+	unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (idx < nstates) {
+		alpha_d[idx] = alpha_d[idx] * b_d[(obs_t * nstates) + idx];
+	}
+}
+
+__global__ void scale_alpha_dev( int nstates,
+				float *alpha_d,
+				float scale)
+{
+	unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (idx < nstates) {
+		alpha_d[idx] = alpha_d[idx] / scale;
+	}
+}
+
+__global__ void init_beta_dev(	int nstates,
+				float *beta_d,
+				float scale)
+{
+	unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (idx < nstates) {
+		beta_d[idx] = 1.0f / scale;
+	}
+}
+
+__global__ void calc_beta_dev(	float *beta_d,
+				float *b_d,
+				float scale_t,
+				int nstates,
+				int obs_t,
+				int t)
+{
+	unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (idx < nstates) {
+		beta_d[(t * nstates) + idx] = beta_d[((t+1) * nstates) + idx] *
+						b_d[(obs_t * nstates) + idx] / scale_t;
+	}
+}
+
+__global__ void calc_gamma_dev(	float *gamma_sum_d,
+				float *alpha_d,
+				float *beta_d,
+				int nstates,
+				int t)
+{
+	unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (idx < nstates) {
+		gamma_sum_d[idx] += alpha_d[(t * nstates) + idx] *
+					beta_d[(t * nstates) + idx];
+	}
+}
+
+__global__ void calc_xi_dev(	float *xi_sum_d,
+				float *a_d,
+				float *b_d,
+				float *alpha_d,
+				float *beta_d,
+				float sum_ab,
+				int nstates,
+				int obs_t,
+				int t)
+{
+	unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	unsigned int idy = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if (idx < nstates && idy < nstates) {
+		xi_sum_d[(idy * nstates) + idx] += alpha_d[(t * nstates) + idy] *
+							a_d[(idy * nstates) + idx] *
+							b_d[(obs_t * nstates) + idx] *
+							beta_d[((t+1) * nstates) + idx] /
+							sum_ab;
+	}
+}
+
+__global__ void est_a_dev(	float *a_d,
+				float *alpha_d,
+				float *beta_d,
+				float *xi_sum_d,
+				float *gamma_sum_d,
+				float sum_ab,
+				int nstates,
+				int length)
+{
+	unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	unsigned int idy = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if (idx < nstates && idy < nstates) {
+		a_d[(idy * nstates) + idx] = xi_sum_d[(idy*nstates) + idx] /
+						(gamma_sum_d[idy] -
+						alpha_d[(length * nstates) + idy] *
+						beta_d[(length * nstates) + idy] /
+						sum_ab);
+	}
+}
+
+__global__ void scale_a_dev(	float *a_d,
+				float *c_d,
+				int nstates)
+{
+	unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	unsigned int idy = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if (idx < nstates && idy < nstates) {
+		a_d[(idy * nstates) + idx] = a_d[(idy * nstates) + idx] / c_d[idy];
+	}
+}
+
+__global__ void acc_b_dev(	float *b_d,
+				float *alpha_d,
+				float *beta_d,
+				float sum_ab,
+				int nstates,
+				int nsymbols,
+				int obs_t,
+				int t)
+{
+	unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	unsigned int idy = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if (idy < nsymbols && idx < nstates && obs_t == idy) {
+		b_d[(idy * nstates) + idx] += alpha_d[(t * nstates) + idx] *
+						beta_d[(t * nstates) + idx] / sum_ab;
+	}
+}
+
+__global__ void est_b_dev(	float *b_d,
+				float *gamma_sum_d,
+				int nstates,
+				int nsymbols)
+{
+	unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	unsigned int idy = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if (idy < nsymbols && idx < nstates) {
+		b_d[(idy * nstates) + idx] = b_d[(idy * nstates) + idx] /
+						gamma_sum_d[idx];
+	}
+}
+
+__global__ void scale_b_dev(	float *b_d,
+				float *c_d,
+				int nstates,
+				int nsymbols)
+{
+	unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	unsigned int idy = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if (idx < nstates && idy < nsymbols) {
+		if (b_d[(idy * nstates) + idx] == 0) {
+			b_d[(idy * nstates) + idx] = 1e-10;
+		} else {
+			b_d[(idy * nstates) + idx] = b_d[(idy * nstates) + idx] / c_d[idx];
+		}
+	}
+}
+
+__global__ void est_pi_dev(	float *pi_d,
+				float *alpha_d,
+				float *beta_d,
+				float sum_ab,
+				int nstates)
+{
+	unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (idx < nstates) {
+		pi_d[idx] = alpha_d[idx] * beta_d[idx] / sum_ab;
+	}
+}
+
+float run_hmm_bwa(	Hmm *hmm,
+			Obs *in_obs,
+			int iterations,
+			float threshold)
+{
+	float *a;
+	float *b;
+	float *pi;
+	int threads_per_block;
+	int nblocks;
+	int size;
+	float new_log_lik;
+	float old_log_lik;
+	int iter;
+
+	a = hmm->a;
+	b = hmm->b;
+	pi = hmm->pi;
+	nsymbols = hmm->nsymbols;
+	nstates = hmm->nstates;
+	obs = in_obs->data;
+	length = in_obs->length;
+
+	cublas_status = cublasInit();
+	if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+		fprintf (stderr, "ERROR: CUBLAS Initialization failure\n");
+		return EXIT_ERROR;
+	}
+
+	scale = (float *) malloc(sizeof(float) * length);
+	if (scale == 0) {
+		fprintf (stderr, "ERROR: Host memory allocation error (scale)\n");
+		return EXIT_ERROR;
+	}
+
+	size = sizeof(float) * nstates * nstates;
+	CUDA_SAFE_CALL( cudaMalloc((void**)&a_d, size) );
+	CUDA_SAFE_CALL( cudaMemcpy(a_d, a, size, cudaMemcpyHostToDevice) );
+	size = sizeof(float) * nstates * nsymbols;
+	CUDA_SAFE_CALL( cudaMalloc((void**)&b_d, size) );
+	CUDA_SAFE_CALL( cudaMemcpy(b_d, b, size, cudaMemcpyHostToDevice) );
+	size = sizeof(float) * nstates;
+	CUDA_SAFE_CALL( cudaMalloc((void**)&pi_d, size) );
+	CUDA_SAFE_CALL( cudaMemcpy(pi_d, pi, size, cudaMemcpyHostToDevice) );
+	size = sizeof(float) * nstates * length;
+	CUDA_SAFE_CALL( cudaMalloc((void**)&alpha_d, size) );
+	size = sizeof(float) * nstates * length;
+	CUDA_SAFE_CALL( cudaMalloc((void**)&beta_d, size) );
+	size = sizeof(float) * nstates;
+	CUDA_SAFE_CALL( cudaMalloc((void**)&gamma_sum_d, size) );
+	size = sizeof(float) * nstates * nstates;
+	CUDA_SAFE_CALL( cudaMalloc((void**)&xi_sum_d, size) );
+	size = sizeof(float) * nstates;
+	CUDA_SAFE_CALL( cudaMalloc((void**)&c_d, size) );
+	size = sizeof(float) * nstates;
+	CUDA_SAFE_CALL( cudaMalloc((void**)&ones_n_d, size) );
+	size = sizeof(float) * nsymbols;
+	CUDA_SAFE_CALL( cudaMalloc((void**)&ones_s_d, size) );
+
+	threads_per_block = MAX_THREADS_PER_BLOCK;
+	nblocks = (nstates + threads_per_block - 1) / threads_per_block;
+	init_ones_dev<<<nblocks, threads_per_block>>>(ones_s_d, nsymbols);
+
+	for (iter = 0; iter < iterations; iter++) {
+
+		new_log_lik = calc_alpha();
+		if (new_log_lik == EXIT_ERROR) {
+			return EXIT_ERROR;
+		}
+
+		if (calc_beta() == EXIT_ERROR) {
+			return EXIT_ERROR;
+		}
+
+		calc_gamma_sum();
+
+		if (calc_xi_sum() == EXIT_ERROR) {
+			return EXIT_ERROR;
+		}
+
+		if (estimate_a() == EXIT_ERROR) {
+			return EXIT_ERROR;
+		}
+
+		if (estimate_b() == EXIT_ERROR) {
+			return EXIT_ERROR;
+		}
+		
+		if (estimate_pi() == EXIT_ERROR) {
+			return EXIT_ERROR;
+		}
+
+		if (threshold > 0 && iter > 0) {
+			if (fabs(pow(10,new_log_lik) - pow(10,old_log_lik)) < threshold) {
+				break;
+			}
+		}
+
+		old_log_lik = new_log_lik;
+
+	}
+
+	size = sizeof(float) * nstates * nstates;
+	CUDA_SAFE_CALL( cudaMemcpy(a, a_d, size, cudaMemcpyDeviceToHost) );
+	size = sizeof(float) * nstates * nsymbols;
+	CUDA_SAFE_CALL( cudaMemcpy(b, b_d, size, cudaMemcpyDeviceToHost) );
+	size = sizeof(float) * nstates;
+	CUDA_SAFE_CALL( cudaMemcpy(pi, pi_d, size, cudaMemcpyDeviceToHost) );
+
+	if(cublasShutdown() != CUBLAS_STATUS_SUCCESS) {
+		printf("ERROR: CUBLAS Shutdown failure\n");
+		return EXIT_ERROR;
+	}
+
+	free(scale);
+	CUDA_SAFE_CALL( cudaFree(a_d) );
+	CUDA_SAFE_CALL( cudaFree(b_d) );
+	CUDA_SAFE_CALL( cudaFree(pi_d) );
+	CUDA_SAFE_CALL( cudaFree(alpha_d) );
+	CUDA_SAFE_CALL( cudaFree(beta_d) );
+	CUDA_SAFE_CALL( cudaFree(gamma_sum_d) );
+	CUDA_SAFE_CALL( cudaFree(xi_sum_d) );
+	CUDA_SAFE_CALL( cudaFree(c_d) );
+	CUDA_SAFE_CALL( cudaFree(ones_n_d) );
+	CUDA_SAFE_CALL( cudaFree(ones_s_d) );
+
+	return new_log_lik;
+}
+
+float calc_alpha()
+{
+	int threads_per_block;
+	int nblocks;
+	int offset_cur;
+	int offset_prev;
+	float log_lik;
+	int t;
+
+	threads_per_block = MAX_THREADS_PER_BLOCK;
+	nblocks = (nstates * threads_per_block - 1) / threads_per_block;
+	init_alpha_dev<<<nblocks, threads_per_block>>>(	b_d,
+							pi_d,
+							nstates,
+							alpha_d,
+							ones_n_d,
+							obs[0]);
+
+	cublasGetError();
+	scale[0] = cublasSdot(nstates, alpha_d, 1, ones_n_d, 1);
+	cublas_status = cublasGetError();
+	if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+		fprintf(stderr, "ERROR: Kernel execution error\n");
+		return EXIT_ERROR;
+	}
+
+	scale_alpha_dev<<<nblocks, threads_per_block>>>(	nstates,
+								alpha_d,
+								scale[0]);
+
+	log_lik = log10(scale[0]);
+
+	for (t = 1; t < length; t++) {
+
+		offset_prev = (t - 1) * nstates;
+		offset_cur = t * nstates;
+
+		cublasSgemv( 'N', nstates, nstates, 1.0f, a_d, nstates,
+			alpha_d + offset_prev, 1, 0, alpha_d + offset_cur, 1 );
+		cublas_status = cublasGetError();
+		if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+			fprintf (stderr, "ERROR: Kernel execution error\n");
+			return EXIT_ERROR;
+		}
+
+		calc_alpha_dev<<<nblocks, threads_per_block>>>(	nstates,
+								alpha_d + offset_cur,
+								b_d,
+								obs[t]);
+
+		scale[t] = cublasSdot(nstates, alpha_d + offset_cur, 1, ones_n_d, 1);
+		cublas_status = cublasGetError();
+		if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+			fprintf (stderr, "ERROR: Kernel execution error\n");
+			return EXIT_ERROR;
+		}
+
+		scale_alpha_dev<<<nblocks, threads_per_block>>>(	nstates,
+									alpha_d + offset_cur,
+									scale[t]);
+
+		log_lik = log10(scale[t]);
+	}
+
+	return log_lik;
+}
+
+int calc_beta()
+{
+	int threads_per_block;
+	int nblocks;
+	int t;
+	
+	threads_per_block = MAX_THREADS_PER_BLOCK;
+	nblocks = (nstates + threads_per_block - 1) / threads_per_block;
+	init_beta_dev<<<nblocks, threads_per_block>>>(	nstates, beta_d +
+							((length - 1) * nstates),
+							scale[length - 1]);
+
+	for (t = length - 2; t >= 0; t--) {
+
+		calc_beta_dev<<<nblocks, threads_per_block>>>(	beta_d,
+								b_d,
+								scale[t],
+								nstates,
+								obs[t+1],
+								t);
+
+		cublasSgemv( 'T', nstates, nstates, 1.0f, a_d, nstates,
+			beta_d + (t * nstates), 1, 0, beta_d + (t * nstates), 1 );
+
+		cublas_status = cublasGetError();
+		if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+			fprintf (stderr, "ERROR: Kernel execution error\n");
+			return EXIT_ERROR;
+		}
+	}
+
+	return 0;
+}
+
+void calc_gamma_sum()
+{
+	int threads_per_block;
+	int nblocks;
+	int size;
+	int t;
+	
+	threads_per_block = MAX_THREADS_PER_BLOCK;
+	nblocks = (nstates + threads_per_block - 1) / threads_per_block;
+
+	size = sizeof(float) * nstates;
+	CUDA_SAFE_CALL( cudaMemset(gamma_sum_d, 0, size) );
+
+	for (t = 0; t < length; t++) {
+		calc_gamma_dev<<<nblocks, threads_per_block>>>(	gamma_sum_d,
+								alpha_d,
+								beta_d,
+								nstates,
+								t);
+	}
+}
+
+int calc_xi_sum()
+{
+	float sum_ab;
+	int nblocks;
+	int size;
+	int t;
+
+	size = sizeof(float) * nstates * nstates;
+	CUDA_SAFE_CALL( cudaMemset(xi_sum_d, 0, size) );
+
+	dim3 threads(BLOCK_DIM, BLOCK_DIM);
+	nblocks = (nstates + BLOCK_DIM - 1) / BLOCK_DIM;
+	dim3 grid(nblocks, nblocks);
+
+	for (t = 0; t < length - 1; t++) {
+		sum_ab = cublasSdot(nstates, alpha_d + (t * nstates), 1,
+						beta_d + (t * nstates), 1);
+		cublas_status = cublasGetError();
+		if ( cublas_status != CUBLAS_STATUS_SUCCESS) {
+			fprintf (stderr, "ERROR: Kernal execution error \n");
+			return EXIT_ERROR;
+		}
+
+		calc_xi_dev<<<grid, threads>>>(	xi_sum_d,
+						a_d,
+						b_d,
+						alpha_d,
+						beta_d,
+						sum_ab,
+						nstates,
+						obs[t+1],
+						t);
+	}
+
+	return 0;
+}
+
+int estimate_a()
+{
+	float sum_ab;
+	int nblocks;
+
+	dim3 threads(BLOCK_DIM, BLOCK_DIM);
+	nblocks = (nstates + BLOCK_DIM - 1) / BLOCK_DIM;
+	dim3 grid(nblocks, nblocks);
+
+	sum_ab = cublasSdot(nstates, alpha_d + ((length-1) * nstates), 1,
+					beta_d + ((length-1) * nstates), 1);
+
+	cublas_status = cublasGetError();
+	if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+		fprintf (stderr, "ERROR: Kernel execution error \n");
+		return EXIT_ERROR;
+	}
+	
+	est_a_dev<<<grid, threads>>>(	a_d,
+					alpha_d,
+					beta_d,
+					xi_sum_d,
+					gamma_sum_d,
+					sum_ab,
+					nstates,
+					length);
+
+	cublasSgemv( 'T', nstates, nstates, 1.0f, a_d, nstates,
+		ones_n_d, 1, 0, c_d, 1 );
+	cublas_status = cublasGetError();
+	if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+		fprintf (stderr, "ERROR: Kernel execution error\n");
+		return EXIT_ERROR;
+	}
+
+	scale_a_dev<<<grid, threads>>>(	a_d,
+					c_d,
+					nstates);
+	
+	return 0;
+}
+
+int estimate_b()
+{
+	float sum_ab;
+	int size;
+	int t;
+
+	size = sizeof(float) * nstates * nsymbols;
+	CUDA_SAFE_CALL( cudaMemset(b_d, 0, size) );
+
+	dim3 threads(BLOCK_DIM, BLOCK_DIM);
+	dim3 grid(	(nstates + threads.x - 1) / threads.x,
+			(nsymbols + threads.y - 1) / threads.y);
+
+	for (t = 0; t < length; t++) {
+		sum_ab = cublasSdot(nstates, alpha_d + (t * nstates), 1,
+						beta_d + (t * nstates), 1);
+		cublas_status = cublasGetError();
+		if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+			fprintf (stderr, "ERROR: Kernel execution error \n");
+			return EXIT_ERROR;
+		}
+
+		acc_b_dev<<<grid, threads>>>(	b_d,
+						alpha_d,
+						beta_d,
+						sum_ab,
+						nstates,
+						nsymbols,
+						obs[t],
+						t);
+	}
+
+	est_b_dev<<<grid, threads>>>(b_d, gamma_sum_d, nstates, nsymbols);
+
+	cublasSgemv( 'N', nstates, nsymbols, 1.0f, b_d, nstates,
+			ones_s_d, 1, 0, c_d, 1 );
+	cublas_status = cublasGetError();
+	if (cublas_status != CUBLAS_STATUS_SUCCESS) {
+		fprintf (stderr, "ERROR: Kernel execution error\n");
+		return EXIT_ERROR;
+	}
+
+	scale_b_dev<<<grid, threads>>>(	b_d,
+					c_d,
+					nstates,
+					nsymbols);
+	return 0;
+}
+
+int estimate_pi()
+{
+	float sum_ab;
+	int threads_per_block;
+	int nblocks;
+
+	sum_ab = cublasSdot(nstates, alpha_d, 1, beta_d, 1);
+
+	threads_per_block = MAX_THREADS_PER_BLOCK;
+	nblocks = (nstates + threads_per_block - 1) / threads_per_block;
+	est_pi_dev<<<nblocks, threads_per_block>>>(	pi_d,
+							alpha_d,
+							beta_d,
+							sum_ab,
+							nstates);
+
+	return 0;
+}
